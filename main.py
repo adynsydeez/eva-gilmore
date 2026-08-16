@@ -1,11 +1,9 @@
 import os
-import threading
-
-from deepface import DeepFace
-import cv2
-from pydub import AudioSegment
-import simpleaudio as sa
 import random
+import cv2
+from deepface import DeepFace
+import pygame
+from collections import deque, Counter
 
 # --- Secure Absolute Paths ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -16,49 +14,38 @@ def get_absolute_track(relative_path):
 # --- Audio State Controller ---
 class AudioController:
     def __init__(self):
-        self.play_handle = None
-        self.playing_path = None
-
-    def play(self, target_path, fade_in=1500, fade_out=2000):
-        # If this exact song is already running, leave it alone
-        if self.playing_path == target_path and self.is_playing():
+        pygame.mixer.init()
+        self.channel1 = pygame.mixer.Channel(0)
+        self.channel2 = pygame.mixer.Channel(1)
+        self.active_channel = self.channel1
+        self.playing_path = ""
+    
+    def play(self, target_path, fade_in=1500, fade_out=1500):
+        if self.playing_path == target_path and self.active_channel.get_busy():
             return
 
-        # Interrupt active playback if it exists
-        self.stop()
+        if self.active_channel.get_busy():
+            self.active_channel.fadeout(fade_out)
+        
+        self.active_channel = self.channel2 if self.active_channel == self.channel1 else self.channel1
 
         try:
             print(f"Switching audio track to: {target_path}")
-            sound = AudioSegment.from_file(target_path)
-            
-            # Apply processing rules
-            if len(sound) > (fade_in + fade_out):
-                sound = sound.fade_in(fade_in).fade_out(fade_out)
-            
-            # Extract raw audio arrays for simpleaudio execution
-            raw_data = sound.raw_data
-            
-            # Trigger non-blocking native playback stream
-            self.play_handle = sa.play_buffer(
-                raw_data,
-                num_channels=sound.channels,
-                bytes_per_sample=sound.sample_width,
-                sample_rate=sound.frame_rate
-            )
+            sound = pygame.mixer.Sound(target_path)
+            self.active_channel.play(sound, fade_ms=fade_in)
             self.playing_path = target_path
         except Exception as e:
             print(f"Playback initiation failure: {e}")
+            self.playing_path = ""
 
-    def stop(self):
-        if self.play_handle and self.play_handle.is_playing():
-            self.play_handle.stop()
-        self.play_handle = None
-        self.playing_path = None
+    def stop(self, fade_out=1500):
+        if self.active_channel.get_busy():
+            self.active_channel.fadeout(fade_out)
+        self.playing_path = ""
 
     def is_playing(self):
-        return self.play_handle is not None and self.play_handle.is_playing()
+        return self.active_channel.get_busy()
 
-# Initialize Controller Object
 audio_sys = AudioController()
 
 # --- Setup System Capture Interfaces ---
@@ -66,13 +53,20 @@ cv2.namedWindow("Face Recognition", cv2.WINDOW_NORMAL)
 vc = cv2.VideoCapture(0)
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
-# Persist state definitions outside the frame interval blocks
+# --- STABILITY TRACKERS ---
 current_emotion = "No face detected"
 current_gender = "Unknown"
-last_triggered_track = None
+
+# Rolling buffers for ML readings (stores the last 5 readings)
+emotion_buffer = deque(maxlen=5)
+gender_buffer = deque(maxlen=5)
+
+# Grace period counters for face detection (prevents audio cutting if you blink or turn your head)
+frames_without_face = 0
+MAX_FACELESS_FRAMES = 30 # roughly 1 second at 30fps
 
 index = 0
-rng = random.random() # Initialize base random scalar
+rng = random.random()
 
 while vc.isOpened():
     ret, frame = vc.read()
@@ -85,10 +79,11 @@ while vc.isOpened():
     faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
 
     if len(faces) > 0:
+        frames_without_face = 0 # Reset the grace period counter
+
         for (x, y, w, h) in faces:
             cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
         
-        # ML pipeline runs every 10 frames to protect application overhead
         if index % 10 == 0:
             try:
                 x, y, w, h = faces[0]
@@ -101,29 +96,40 @@ while vc.isOpened():
                     silent=True
                 )
                 
-                new_emotion = analysis[0]['dominant_emotion']
-                new_gender = analysis[0]['dominant_gender']
+                # Append raw readings to rolling buffers
+                emotion_buffer.append(analysis[0]['dominant_emotion'])
+                gender_buffer.append(analysis[0]['dominant_gender'])
                 
-                # If the emotion physically changed, recalculate the RNG choice matrix!
-                if new_emotion != current_emotion:
+                # Extract the most common element in the buffers
+                smoothed_emotion = Counter(emotion_buffer).most_common(1)[0][0]
+                smoothed_gender = Counter(gender_buffer).most_common(1)[0][0]
+                
+                if smoothed_emotion != current_emotion:
                     rng = random.random()
-                    print(f"Emotion shift detected! New RNG generated: {rng:.2f}")
+                    print(f"Emotion shift detected! ({current_emotion} -> {smoothed_emotion}) New RNG: {rng:.2f}")
 
-                current_emotion = new_emotion
-                current_gender = new_gender
+                current_emotion = smoothed_emotion
+                current_gender = smoothed_gender
                 
             except Exception as e:
-                print(f"DeepFace processing block error: {e}")
+                pass # Suppress DeepFace errors
     else:
-        if current_emotion != "No face detected":
-            current_emotion = "No face detected"
-            current_gender = "Unknown"
-            audio_sys.stop() # Turn off sound if user walks away
+        # Increment the faceless counter instead of instantly stopping
+        frames_without_face += 1
+        
+        if frames_without_face > MAX_FACELESS_FRAMES:
+            if current_emotion != "No face detected":
+                print("Face lost for >1 second. Clearing state and fading out audio.")
+                current_emotion = "No face detected"
+                current_gender = "Unknown"
+                emotion_buffer.clear()
+                gender_buffer.clear()
+                audio_sys.stop() 
 
     # --- Persistent Evaluation Matrix ---
-    if current_gender == 'Man':
-        chosen_track = None
+    chosen_track = None
 
+    if current_gender == 'Man':
         if current_emotion == 'happy':
             if rng < 0.33:
                 chosen_track = "audio/Happy/Happy1.wav"
@@ -140,16 +146,22 @@ while vc.isOpened():
             else:
                 chosen_track = "audio/Sad/Sad3.wav"
 
-        if chosen_track:
-            full_track_path = get_absolute_track(chosen_track)
-            
-            # If the song has ended naturally, reset RNG to loop a potentially different track
-            if not audio_sys.is_playing() and audio_sys.playing_path is not None:
-                rng = random.random()
-                print(f"Track finished naturally. Re-rolling RNG: {rng:.2f}")
-            
-            # Submit to state engine
-            audio_sys.play(full_track_path)
+        elif current_emotion == 'angry':
+            chosen_track = "audio/Angry/Angry1.wav"
+
+    # --- State Execution Engine ---
+    if chosen_track:
+        full_track_path = get_absolute_track(chosen_track)
+        
+        if not audio_sys.is_playing() and audio_sys.playing_path != "":
+            rng = random.random()
+            print(f"Track finished naturally. Re-rolling RNG: {rng:.2f}")
+        
+        audio_sys.play(full_track_path)
+    else:
+        # Stop existing audio if an unmapped emotion (like fear/neutral) is stable enough to become the current_emotion
+        if audio_sys.is_playing() and current_emotion != "No face detected":
+            audio_sys.stop()
 
     # --- UI Rendering Layer ---
     status = f"Emotion: {current_emotion} | Gender: {current_gender}"
@@ -157,12 +169,16 @@ while vc.isOpened():
         status += f" | Track: {os.path.basename(audio_sys.playing_path)}"
         
     cv2.putText(frame, status, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    
+    # Optional debug text to see the buffer at work
+    # cv2.putText(frame, f"Raw Buffer: {list(emotion_buffer)}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+
     cv2.imshow("Face Recognition", frame)
     
-    if cv2.waitKey(20) & 0xFF == 27: # ESC hook
+    if cv2.waitKey(20) & 0xFF == 27:
         break
 
-# Clean terminations
 audio_sys.stop()
+pygame.quit()
 vc.release()
 cv2.destroyAllWindows()
