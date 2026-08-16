@@ -129,7 +129,7 @@ while vc.isOpened():
     # --- Persistent Evaluation Matrix ---
     chosen_track = None
 
-    if current_gender == 'Man':
+    if current_gender == 'Woman':
         if current_emotion == 'happy':
             if rng < 0.33:
                 chosen_track = "audio/Happy/Happy1.wav"
